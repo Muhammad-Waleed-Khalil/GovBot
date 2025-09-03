@@ -1,6 +1,6 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+import json
 from typing import List, Optional, Dict, Any
 import logging
 import os
@@ -17,22 +17,6 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="RAG Pipeline API",
-    description="Retrieval-Augmented Generation API with Qdrant and Gemini",
-    version="1.0.0"
-)
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for Vercel deployment
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Configuration class for RAG pipeline
 class RAGConfig:
     def __init__(self):
@@ -45,30 +29,31 @@ class RAGConfig:
 # Global configuration instance
 rag_config = RAGConfig()
 
-# Pydantic models
-class ChatMessage(BaseModel):
-    role: str  # 'user' or 'assistant'
-    content: str
-    timestamp: Optional[str] = None
+# Data models for request/response
+class ChatMessage:
+    def __init__(self, role: str, content: str, timestamp: Optional[str] = None):
+        self.role = role
+        self.content = content
+        self.timestamp = timestamp
 
-class ChatRequest(BaseModel):
-    query: str
-    retrieval_count: Optional[int] = None
-    conversation_history: Optional[List[ChatMessage]] = []
+class ChatRequest:
+    def __init__(self, query: str, retrieval_count: Optional[int] = None, conversation_history: Optional[List[Dict]] = None):
+        self.query = query
+        self.retrieval_count = retrieval_count
+        self.conversation_history = conversation_history or []
 
-class ChatResponse(BaseModel):
-    answer: str
-    documents_retrieved: int
-    sources: List[Dict[str, str]] = []
-
-class ActionRequest(BaseModel):
-    query: str
-    context: str
-    action_type: str
-
-class ActionResponse(BaseModel):
-    result: str
-    action_type: str
+class ChatResponse:
+    def __init__(self, answer: str, documents_retrieved: int, sources: List[Dict[str, str]] = None):
+        self.answer = answer
+        self.documents_retrieved = documents_retrieved
+        self.sources = sources or []
+    
+    def to_dict(self):
+        return {
+            "answer": self.answer,
+            "documents_retrieved": self.documents_retrieved,
+            "sources": self.sources
+        }
 
 # Global variables for models and clients
 embedding_model = None
@@ -122,7 +107,7 @@ def get_embedding(text: str) -> List[float]:
         return embedding.tolist()
     except Exception as e:
         logger.error(f"Error generating embedding: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error generating embedding")
+        raise Exception(f"Error generating embedding: {str(e)}")
 
 def search_qdrant(query_embedding: List[float], top_k: Optional[int] = None) -> List[Dict[str, Any]]:
     """Search Qdrant for similar documents with configurable retrieval count."""
@@ -158,7 +143,7 @@ def search_qdrant(query_embedding: List[float], top_k: Optional[int] = None) -> 
         
     except Exception as e:
         logger.error(f"Error searching Qdrant: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error searching vector database")
+        raise Exception(f"Error searching vector database: {str(e)}")
 
 def prepare_context_from_documents(retrieved_docs: List[Dict[str, Any]]) -> str:
     """Prepare context string from retrieved documents with full metadata."""
@@ -200,37 +185,50 @@ Response:"""
     
     return refining_prompt
 
-@app.get("/")
-async def root():
-    return {"message": "RAG Pipeline API is running", "status": "healthy"}
-
-@app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest):
-    """Main chat endpoint for RAG pipeline"""
+def handle_chat_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle chat request for RAG pipeline"""
     try:
         initialize_models()
         
+        # Parse request data
+        query = request_data.get('query', '')
+        retrieval_count = request_data.get('retrieval_count')
+        conversation_history = request_data.get('conversation_history', [])
+        
+        if not query:
+            return {
+                "error": "Query is required",
+                "status_code": 400
+            }
+        
         # Generate embedding for the query
-        query_embedding = get_embedding(request.query)
+        query_embedding = get_embedding(query)
         
         # Search for relevant documents
-        retrieved_docs = search_qdrant(query_embedding, request.retrieval_count)
+        retrieved_docs = search_qdrant(query_embedding, retrieval_count)
         
         if not retrieved_docs:
-            return ChatResponse(
+            response = ChatResponse(
                 answer="I couldn't find relevant information to answer your question. Please try rephrasing your query.",
                 documents_retrieved=0,
                 sources=[]
             )
+            return response.to_dict()
         
         # Prepare context from retrieved documents
         retrieved_context = prepare_context_from_documents(retrieved_docs)
         
+        # Create conversation history objects
+        chat_history = []
+        for msg in conversation_history:
+            if isinstance(msg, dict):
+                chat_history.append(ChatMessage(msg.get('role', ''), msg.get('content', '')))
+        
         # Create the prompt
-        prompt = create_government_prompt(request.query, retrieved_context, request.conversation_history)
+        prompt = create_government_prompt(query, retrieved_context, chat_history)
         
         # Generate response using Gemini
-        response = gemini_model.generate_content(prompt)
+        gemini_response = gemini_model.generate_content(prompt)
         
         # Prepare sources
         sources = [
@@ -242,20 +240,78 @@ async def chat_endpoint(request: ChatRequest):
             for doc in retrieved_docs[:5]  # Top 5 sources
         ]
         
-        return ChatResponse(
-            answer=response.text,
+        response = ChatResponse(
+            answer=gemini_response.text,
             documents_retrieved=len(retrieved_docs),
             sources=sources
         )
         
+        return response.to_dict()
+        
     except Exception as e:
         logger.error(f"Error in chat endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
+        return {
+            "error": f"Error processing request: {str(e)}",
+            "status_code": 500
+        }
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "message": "API is running"}
-
-# Vercel serverless function handler
-handler = app
+def handler(request, response):
+    """Vercel serverless function handler"""
+    # Set CORS headers
+    response['Access-Control-Allow-Origin'] = '*'
+    response['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    
+    # Handle preflight OPTIONS request
+    if request.get('method') == 'OPTIONS':
+        response['statusCode'] = 200
+        return ''
+    
+    # Parse URL path
+    path = request.get('url', '').split('?')[0]
+    method = request.get('method', 'GET')
+    
+    try:
+        if path == '/' and method == 'GET':
+            # Root endpoint
+            result = {"message": "RAG Pipeline API is running", "status": "healthy"}
+            response['statusCode'] = 200
+            response['headers'] = {'Content-Type': 'application/json'}
+            return json.dumps(result)
+            
+        elif path == '/health' and method == 'GET':
+            # Health check endpoint
+            result = {"status": "healthy", "message": "API is running"}
+            response['statusCode'] = 200
+            response['headers'] = {'Content-Type': 'application/json'}
+            return json.dumps(result)
+            
+        elif path == '/chat' and method == 'POST':
+            # Chat endpoint
+            body = request.get('body', '{}')
+            if isinstance(body, str):
+                request_data = json.loads(body)
+            else:
+                request_data = body
+                
+            result = handle_chat_request(request_data)
+            
+            if 'error' in result:
+                response['statusCode'] = result.get('status_code', 500)
+            else:
+                response['statusCode'] = 200
+                
+            response['headers'] = {'Content-Type': 'application/json'}
+            return json.dumps(result)
+            
+        else:
+            # Not found
+            response['statusCode'] = 404
+            response['headers'] = {'Content-Type': 'application/json'}
+            return json.dumps({"error": "Not found"})
+            
+    except Exception as e:
+        logger.error(f"Handler error: {str(e)}")
+        response['statusCode'] = 500
+        response['headers'] = {'Content-Type': 'application/json'}
+        return json.dumps({"error": f"Internal server error: {str(e)}"})
